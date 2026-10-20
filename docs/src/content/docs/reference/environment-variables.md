@@ -32,6 +32,7 @@ For the offline workflow (pre-downloading models, local paths), see [run models]
 |---|---|
 | `MISTRALRS_NO_MMAP` | `MISTRALRS_NO_MMAP=1` loads safetensors without mmap. |
 | `MISTRALRS_ISQ_SINGLETHREAD` | If set, runs [ISQ (in-situ quantization)](/reference/quantization-types/) single-threaded. |
+| `MISTRALRS_KV_QUANT` | Quantizes the non-paged KV cache, used on CPU, with mixed GPU/CPU placement, and with paged attention off. K and V rows are Hadamard-rotated in groups of 32 and stored as `q8` (8-bit, about 1.9x smaller than BF16) or `q4` (4-bit, about 3.6x smaller). Head dims not divisible by 32 stay unquantized. Every forward pass dequantizes one layer's cache at a time, so decode is slower at long contexts. Paged attention uses `--pa-cache-type` instead. |
 
 ## CPU runtime
 
