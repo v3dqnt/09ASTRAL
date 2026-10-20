@@ -92,7 +92,6 @@ mistralrs-audio.workspace = true
 mistralrs-mcp = { workspace = true, features = ["utoipa"] }
 mistralrs-code-exec.workspace = true
 mistralrs-sandbox.workspace = true
-openai-harmony = "0.0.8"
 
 [target.'cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))'.dependencies]
 objc = { workspace = true, optional = true }

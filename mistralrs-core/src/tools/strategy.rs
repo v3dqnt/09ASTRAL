@@ -267,23 +267,14 @@ impl HarmonyToolCallStrategy {
     }
 
     fn context_mut(&mut self) -> Option<&mut HarmonyContext> {
-        if self.context.is_none() {
-            match HarmonyContext::new() {
-                Ok(context) => self.context = Some(context),
-                Err(e) => {
-                    tracing::warn!("Failed to initialize Harmony parser: {e}");
-                    return None;
-                }
-            }
-        }
-        self.context.as_mut()
+        Some(self.context.get_or_insert_with(HarmonyContext::new))
     }
 }
 
 impl ToolCallStrategy for HarmonyToolCallStrategy {
-    fn observe_token(&mut self, token: u32, _bytes: &[u8]) {
+    fn observe_token(&mut self, _token: u32, bytes: &[u8]) {
         if let Some(context) = self.context_mut() {
-            context.process_token(token);
+            context.process_token(bytes);
         }
     }
 

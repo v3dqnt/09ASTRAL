@@ -12,11 +12,204 @@
 //!
 //! This module provides incremental parsing of Harmony-formatted token streams.
 
-use openai_harmony::{
-    chat::Role, load_harmony_encoding, HarmonyEncoding, HarmonyEncodingName, StreamableParser,
-};
-use std::sync::OnceLock;
 use uuid::Uuid;
+
+const START: &str = "<|start|>";
+const CHANNEL: &str = "<|channel|>";
+const CONSTRAIN: &str = "<|constrain|>";
+const MESSAGE: &str = "<|message|>";
+const STOPS: [&str; 3] = ["<|end|>", "<|call|>", "<|return|>"];
+const ROLES: [&str; 5] = ["system", "developer", "user", "assistant", "tool"];
+
+#[derive(Debug, Default, Clone, PartialEq)]
+struct Header {
+    recipient: Option<String>,
+    channel: Option<String>,
+}
+
+#[derive(Debug)]
+enum ParseState {
+    ExpectStart,
+    Header { text: String, role_known: bool },
+    Content { header: Header, bytes: Vec<u8> },
+}
+
+/// Streaming Harmony parser over the detokenized output, where real special tokens appear as their text and
+/// spelled-out ones were already defused by `SpecialTextGuard`. Mirrors openai-harmony's `StreamableParser`.
+struct StreamParser {
+    state: ParseState,
+    pending: String,
+}
+
+impl StreamParser {
+    fn new() -> Self {
+        Self {
+            state: ParseState::Header {
+                text: String::new(),
+                role_known: true,
+            },
+            pending: String::new(),
+        }
+    }
+
+    fn process(&mut self, bytes: &[u8]) {
+        if let ParseState::Content { bytes: content, .. } = &mut self.state {
+            if !STOPS.iter().any(|m| contains(bytes, m.as_bytes())) {
+                content.extend_from_slice(bytes);
+                return;
+            }
+        }
+        self.pending.push_str(&String::from_utf8_lossy(bytes));
+        loop {
+            match &mut self.state {
+                ParseState::ExpectStart => match self.pending.find(START) {
+                    Some(i) => {
+                        self.pending.drain(..i + START.len());
+                        self.state = ParseState::Header {
+                            text: String::new(),
+                            role_known: false,
+                        };
+                    }
+                    None => {
+                        self.pending.clear();
+                        return;
+                    }
+                },
+                ParseState::Header { text, role_known } => {
+                    let msg = self.pending.find(MESSAGE);
+                    let stop = first_stop(&self.pending);
+                    match (msg, stop) {
+                        (Some(i), s) if s.is_none_or(|(j, _)| i < j) => {
+                            text.push_str(&self.pending[..i]);
+                            let header = parse_header(text, *role_known);
+                            self.pending.drain(..i + MESSAGE.len());
+                            self.state = match header {
+                                Some(header) => ParseState::Content {
+                                    header,
+                                    bytes: Vec::new(),
+                                },
+                                None => ParseState::ExpectStart,
+                            };
+                        }
+                        (_, Some((j, len))) => {
+                            self.pending.drain(..j + len);
+                            self.state = ParseState::ExpectStart;
+                        }
+                        _ => {
+                            text.push_str(&self.pending);
+                            self.pending.clear();
+                            return;
+                        }
+                    }
+                }
+                ParseState::Content { bytes, .. } => match first_stop(&self.pending) {
+                    Some((j, len)) => {
+                        bytes.extend_from_slice(&self.pending.as_bytes()[..j]);
+                        self.pending.drain(..j + len);
+                        self.state = ParseState::ExpectStart;
+                    }
+                    None => {
+                        bytes.extend_from_slice(self.pending.as_bytes());
+                        self.pending.clear();
+                        return;
+                    }
+                },
+            }
+        }
+    }
+
+    fn process_eos(&mut self) {
+        if matches!(self.state, ParseState::Content { .. }) {
+            self.state = ParseState::ExpectStart;
+        }
+    }
+
+    fn header(&self) -> Option<&Header> {
+        match &self.state {
+            ParseState::Content { header, .. } => Some(header),
+            _ => None,
+        }
+    }
+
+    fn current_channel(&self) -> Option<String> {
+        self.header()?.channel.clone()
+    }
+
+    fn current_recipient(&self) -> Option<String> {
+        self.header()?.recipient.clone()
+    }
+
+    /// Content so far, holding back an incomplete trailing UTF-8 sequence.
+    fn current_content(&self) -> String {
+        let ParseState::Content { bytes, .. } = &self.state else {
+            return String::new();
+        };
+        let end = match std::str::from_utf8(bytes) {
+            Err(e) if e.error_len().is_none() => e.valid_up_to(),
+            _ => bytes.len(),
+        };
+        String::from_utf8_lossy(&bytes[..end]).into_owned()
+    }
+}
+
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+fn first_stop(s: &str) -> Option<(usize, usize)> {
+    STOPS
+        .iter()
+        .filter_map(|m| s.find(m).map(|i| (i, m.len())))
+        .min()
+}
+
+/// Port of openai-harmony's `parse_header_from_string`; `None` means a malformed header.
+fn parse_header(header: &str, role_known: bool) -> Option<Header> {
+    let mut header = header.to_string();
+    let mut channel = None;
+    if let Some(idx) = header.find(CHANNEL) {
+        let after = &header[idx + CHANNEL.len()..];
+        let end = after
+            .find(|c: char| c.is_whitespace() || c == '<')
+            .unwrap_or(after.len());
+        if end == 0 {
+            return None;
+        }
+        channel = Some(after[..end].to_string());
+        header = format!("{}{}", &header[..idx], &after[end..]);
+    }
+    let header = header.trim().replace(CONSTRAIN, &format!(" {CONSTRAIN}"));
+    let mut parts: Vec<&str> = header.split_ascii_whitespace().collect();
+
+    let role = if role_known {
+        "assistant"
+    } else {
+        let first = *parts.first()?;
+        if ROLES.contains(&first) {
+            first
+        } else if parts.len() > 1 || first.starts_with("to=") {
+            parts.remove(0);
+            "tool"
+        } else {
+            return None;
+        }
+    };
+    if parts.first() == Some(&role) {
+        parts.remove(0);
+    }
+
+    let mut recipient = None;
+    if let Some(last) = parts.pop() {
+        if let Some(r) = last.strip_prefix("to=") {
+            recipient = Some(r.to_string());
+        } else if parts.is_empty() {
+            recipient = Some(last.to_string());
+        } else if let Some(r) = parts.pop() {
+            recipient = Some(r.strip_prefix("to=").unwrap_or(r).to_string());
+        }
+    }
+    parts.is_empty().then_some(Header { recipient, channel })
+}
 
 /// Extract the tool name from a recipient string.
 /// - "functions.my_tool" -> "my_tool"
@@ -122,10 +315,9 @@ impl HarmonyAccumulated {
 
 /// Context for tracking Harmony parsing state within a sequence.
 ///
-/// This wraps the openai-harmony crate's StreamableParser and provides
-/// delta extraction for streaming responses.
+/// Wraps the streaming parser and provides delta extraction for streaming responses.
 pub struct HarmonyContext {
-    parser: StreamableParser,
+    parser: StreamParser,
     // Track lengths for delta extraction (for parser content)
     last_analysis_len: usize,
     last_commentary_len: usize,
@@ -148,14 +340,17 @@ pub struct HarmonyContext {
     needs_grammar_activation: bool,
 }
 
+impl Default for HarmonyContext {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl HarmonyContext {
     /// Create a new Harmony parsing context
-    pub fn new() -> Result<Self, anyhow::Error> {
-        let encoding = get_harmony_encoding().clone();
-        let parser = StreamableParser::new(encoding, Some(Role::Assistant))
-            .map_err(|e| anyhow::anyhow!("Failed to create Harmony parser: {:?}", e))?;
-        Ok(Self {
-            parser,
+    pub fn new() -> Self {
+        Self {
+            parser: StreamParser::new(),
             last_analysis_len: 0,
             last_commentary_len: 0,
             last_final_len: 0,
@@ -167,13 +362,12 @@ impl HarmonyContext {
             current_tool_call: None,
             sent_tool_args_len: 0,
             needs_grammar_activation: false,
-        })
+        }
     }
 
-    /// Process a token and return any new delta content
-    pub fn process_token(&mut self, token_id: u32) -> HarmonyDelta {
-        // process() returns Result, ignore errors for robustness
-        let _ = self.parser.process(token_id);
+    /// Process a token's detokenized bytes (special tokens included) and return any new delta content
+    pub fn process_token(&mut self, bytes: &[u8]) -> HarmonyDelta {
+        self.parser.process(bytes);
         self.extract_delta()
     }
 
@@ -194,8 +388,8 @@ impl HarmonyContext {
         let current_recipient = self.parser.current_recipient();
 
         // Get current content and extract delta based on channel
-        // current_content() returns Result<String>
-        if let Ok(content) = self.parser.current_content() {
+        {
+            let content = self.parser.current_content();
             // Check if this is a tool call
             // Tool calls have recipients like:
             // - "functions.tool_name" for user-defined tools
@@ -343,7 +537,7 @@ impl HarmonyContext {
 
     /// Signal end of stream to the parser
     pub fn process_eos(&mut self) {
-        let _ = self.parser.process_eos();
+        self.parser.process_eos();
 
         // Finalize any pending tool call
         if let Some((recipient, args)) = self.current_tool_call.take() {
@@ -398,31 +592,6 @@ impl HarmonyContext {
     }
 }
 
-/// Global harmony encoding (lazy loaded)
-static HARMONY_ENCODING: OnceLock<HarmonyEncoding> = OnceLock::new();
-
-/// Pre-initialize the Harmony encoding. This MUST be called from a non-async
-/// context (e.g., during pipeline loading) before any async code runs.
-/// The openai-harmony crate uses reqwest::blocking which creates its own
-/// tokio runtime, so it cannot be called from within an existing async context.
-pub fn prewarm_harmony_encoding() {
-    let _ = HARMONY_ENCODING.get_or_init(|| {
-        load_harmony_encoding(HarmonyEncodingName::HarmonyGptOss)
-            .expect("Failed to load Harmony encoding")
-    });
-}
-
-/// Check if the Harmony encoding has been initialized.
-pub fn is_harmony_encoding_ready() -> bool {
-    HARMONY_ENCODING.get().is_some()
-}
-
-fn get_harmony_encoding() -> &'static HarmonyEncoding {
-    HARMONY_ENCODING
-        .get()
-        .expect("Harmony encoding not initialized. Call prewarm_harmony_encoding() first.")
-}
-
 /// Check if a chat template uses Harmony format by looking for Harmony markers.
 ///
 /// Returns true if the template contains Harmony-specific tokens like
@@ -442,6 +611,116 @@ pub fn is_harmony_template(template: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn feed(ctx: &mut HarmonyContext, pieces: &[&str]) {
+        for p in pieces {
+            ctx.process_token(p.as_bytes());
+        }
+    }
+
+    #[test]
+    fn test_parse_header() {
+        let h = |s, known| parse_header(s, known);
+        assert_eq!(
+            h("<|channel|>analysis", true),
+            Some(Header {
+                recipient: None,
+                channel: Some("analysis".into())
+            })
+        );
+        assert_eq!(
+            h(
+                " to=functions.get_weather<|channel|>commentary <|constrain|>json",
+                true
+            ),
+            Some(Header {
+                recipient: Some("functions.get_weather".into()),
+                channel: Some("commentary".into())
+            })
+        );
+        assert_eq!(
+            h("assistant<|channel|>commentary to=python code", false),
+            Some(Header {
+                recipient: Some("python".into()),
+                channel: Some("commentary".into())
+            })
+        );
+        assert_eq!(
+            h("functions.x to=assistant<|channel|>commentary", false),
+            Some(Header {
+                recipient: Some("assistant".into()),
+                channel: Some("commentary".into())
+            })
+        );
+        assert_eq!(h("bogus", false), None);
+        assert_eq!(h("<|channel|>", true), None);
+        assert_eq!(h("a b c", true), None);
+    }
+
+    #[test]
+    fn test_stream_reasoning_then_final() {
+        let mut ctx = HarmonyContext::new();
+        let mut reasoning = String::new();
+        let mut fin = String::new();
+        for p in [
+            "<|channel|>",
+            "analysis",
+            "<|message|>",
+            "Think",
+            "ing.",
+            "<|end|>",
+            "<|start|>",
+            "assistant",
+            "<|channel|>",
+            "final",
+            "<|message|>",
+            "Hi",
+            "E9",
+            "<|return|>",
+        ] {
+            let bytes: Vec<u8> = if p == "E9" {
+                vec![b' ', 0xc3, 0xa9]
+            } else {
+                p.into()
+            };
+            let d = ctx.process_token(&bytes);
+            reasoning.push_str(&d.analysis_delta.unwrap_or_default());
+            fin.push_str(&d.final_delta.unwrap_or_default());
+        }
+        assert_eq!(reasoning, "Thinking.");
+        assert_eq!(fin, "Hi \u{e9}");
+        assert!(!ctx.has_tool_call());
+    }
+
+    #[test]
+    fn test_stream_split_utf8() {
+        let mut p = StreamParser::new();
+        p.process(b"<|channel|>final<|message|>a");
+        p.process(&[0xe2, 0x82]);
+        assert_eq!(p.current_content(), "a");
+        p.process(&[0xac]);
+        assert_eq!(p.current_content(), "a\u{20ac}");
+    }
+
+    #[test]
+    fn test_stream_tool_call() {
+        let mut ctx = HarmonyContext::new();
+        feed(
+            &mut ctx,
+            &[
+                "<|channel|>analysis<|message|>need weather",
+                "<|end|>",
+                "<|start|>assistant<|channel|>commentary to=functions.get_weather <|constrain|>json<|message|>",
+                "{\"city\":",
+                "\"Paris\"}",
+                "<|call|>",
+            ],
+        );
+        let calls = ctx.finalize_tool_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "get_weather");
+        assert_eq!(calls[0].arguments, "{\"city\":\"Paris\"}");
+    }
 
     #[test]
     fn test_is_harmony_template() {

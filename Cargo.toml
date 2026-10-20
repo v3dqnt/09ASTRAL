@@ -63,20 +63,13 @@ futures = "0.3"
 clap = { version = "4.5.54", features = ["derive", "wrap_help"] }
 pyo3 = { version = "0.25.1", features = ["full", "extension-module", "either", "abi3-py310"] }
 tokio = { version = "1.49.0", features = ["full", "rt-multi-thread"] }
-# All features but avif, avif increases the msrv dramatically
+# Formats people send to models; avif/exr/hdr and other niche codecs cost a lot of build time
 image = { version = "0.25.9", default-features = false, features = [
     'bmp',
-    'dds',
-    'exr',
-    'ff',
     'gif',
-    'hdr',
     'ico',
     'jpeg',
     'png',
-    'pnm',
-    'qoi',
-    'tga',
     'tiff',
     'webp',
 ] }
@@ -194,6 +187,9 @@ mistralrs-sandbox = { path = "mistralrs-sandbox", version = "0.9.5" }
 [profile.release-with-debug]
 inherits = "release"
 debug = true
+
+[profile.release]
+strip = true
 
 # Makes release profiler faster to build
 # The improvement is negligible with it.
