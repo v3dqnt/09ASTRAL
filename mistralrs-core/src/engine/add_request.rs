@@ -693,14 +693,24 @@ impl Engine {
                         max_seq_len,
                         model_metadata.k_head_dim_for_layer(layer_idx),
                     );
+                    let k_packed = crate::kv_cache::quant::packed_dim(k_shape.3);
                     let v_shape = (
                         1usize,
                         model_metadata.num_kv_heads_for_layer(layer_idx),
                         max_seq_len,
                         model_metadata.v_head_dim_for_layer(layer_idx),
                     );
+                    let v_packed = crate::kv_cache::quant::packed_dim(v_shape.3);
+                    let (k_shape, k_dtype) = match k_packed {
+                        Some(n) => ((k_shape.0, k_shape.1, k_shape.2, n), candle_core::DType::U8),
+                        None => (k_shape, dtype),
+                    };
+                    let (v_shape, v_dtype) = match v_packed {
+                        Some(n) => ((v_shape.0, v_shape.1, v_shape.2, n), candle_core::DType::U8),
+                        None => (v_shape, dtype),
+                    };
 
-                    let k_seq_cache = match Tensor::zeros(k_shape, dtype, &device) {
+                    let k_seq_cache = match Tensor::zeros(k_shape, k_dtype, &device) {
                         Ok(x) => x,
                         Err(err) => {
                             request
@@ -714,10 +724,10 @@ impl Engine {
                             return;
                         }
                     };
-                    let v_seq_cache = if k_shape == v_shape {
+                    let v_seq_cache = if k_shape == v_shape && k_dtype == v_dtype {
                         k_seq_cache.clone()
                     } else {
-                        match Tensor::zeros(v_shape, dtype, &device) {
+                        match Tensor::zeros(v_shape, v_dtype, &device) {
                             Ok(x) => x,
                             Err(err) => {
                                 request

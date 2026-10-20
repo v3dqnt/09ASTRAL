@@ -11,6 +11,7 @@ use crate::{
 
 mod full_cache;
 mod hybrid_cache;
+pub(crate) mod quant;
 mod rotating_cache;
 mod single_cache;
 
@@ -125,6 +126,24 @@ impl KvCache {
         }
     }
 
+    /// Stored K without dequantizing a quantized cache.
+    pub fn raw_k(&self) -> Result<Option<Tensor>> {
+        match self {
+            Self::Normal { k, .. } => k.current_raw(),
+            Self::Rotating { k, .. } => k.current_data(),
+            Self::Shared { .. } => Ok(None),
+        }
+    }
+
+    /// Stored V without dequantizing a quantized cache.
+    pub fn raw_v(&self) -> Result<Option<Tensor>> {
+        match self {
+            Self::Normal { v, .. } => v.current_raw(),
+            Self::Rotating { v, .. } => v.current_data(),
+            Self::Shared { .. } => Ok(None),
+        }
+    }
+
     /// Return the K tensor from the last `append()` call.
     ///
     /// For Normal caches this is identical to `k()`. For Rotating caches it
@@ -153,7 +172,11 @@ impl KvCache {
         // Metal fast-path: fuse the K and V slice_set calls into one kernel.
         // Skip if inputs aren't already contiguous; the slow path will fix that.
         #[cfg(feature = "metal")]
-        if k.device().is_metal() && k.is_contiguous() && v.is_contiguous() {
+        if k.device().is_metal()
+            && k.is_contiguous()
+            && v.is_contiguous()
+            && quant::kv_quant().is_none()
+        {
             #[allow(clippy::collapsible_match)]
             match self {
                 Self::Normal { k: kc, v: vc } => {
@@ -585,6 +608,7 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                             current_seq_len: template_cache_csl,
                             max_seq_len: template_cache_msl,
                             capacity_seq_len: template_cache_capsl,
+                            out_dtype: old_k.out_dtype,
                         },
                         v: SingleCache {
                             all_data: v_cache.map(|x| x.contiguous().unwrap()),
@@ -592,6 +616,7 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                             current_seq_len: template_cache_csl,
                             max_seq_len: template_cache_msl,
                             capacity_seq_len: template_cache_capsl,
+                            out_dtype: old_k.out_dtype,
                         },
                     });
                 }
@@ -647,7 +672,7 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                 continue;
             }
             // This case for llama 3.2 vision cross attn
-            if cache.k().unwrap().is_none() {
+            if cache.raw_k().unwrap().is_none() {
                 continue;
             }
 
@@ -688,6 +713,7 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                                 current_seq_len: cache_k.current_seq_len,
                                 max_seq_len: cache_k.max_seq_len,
                                 capacity_seq_len: cache_k.capacity_seq_len,
+                                out_dtype: cache_k.out_dtype,
                             },
                             v: SingleCache {
                                 all_data: Some(v),
@@ -695,6 +721,7 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                                 current_seq_len: cache_v.current_seq_len,
                                 max_seq_len: cache_v.max_seq_len,
                                 capacity_seq_len: cache_v.capacity_seq_len,
+                                out_dtype: cache_v.out_dtype,
                             },
                         });
                     }
@@ -847,6 +874,7 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                             current_seq_len: 0,
                             max_seq_len: template_cache_msl,
                             capacity_seq_len: k_cache.dims()[template_cache_dim],
+                            out_dtype: k.out_dtype,
                         },
                         v: SingleCache {
                             all_data: Some(v_cache.zeros_like().unwrap()),
@@ -854,6 +882,7 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                             current_seq_len: 0,
                             max_seq_len: template_cache_msl,
                             capacity_seq_len: k_cache.dims()[template_cache_dim],
+                            out_dtype: k.out_dtype,
                         },
                     };
                     *layer = cache;
@@ -1236,7 +1265,7 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for HybridCa
                         if template_cache.is_none() {
                             template_cache = Some(kv.clone());
                         }
-                        if let (Ok(Some(k)), Ok(Some(v))) = (kv.k(), kv.v()) {
+                        if let (Ok(Some(k)), Ok(Some(v))) = (kv.raw_k(), kv.raw_v()) {
                             k_tensors.push(k);
                             v_tensors.push(v);
                         }
@@ -1296,7 +1325,7 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for HybridCa
             let layer_cache = hybrid_cache.caches.get(layer_idx).unwrap();
 
             if let HybridLayerCache::Attention(kv_cache) = layer_cache {
-                if let (Ok(Some(k)), Ok(Some(v))) = (kv_cache.k(), kv_cache.v()) {
+                if let (Ok(Some(k)), Ok(Some(v))) = (kv_cache.raw_k(), kv_cache.raw_v()) {
                     let k_chunks = k.chunk(num_seqs, 0).unwrap();
                     let v_chunks = v.chunk(num_seqs, 0).unwrap();
 

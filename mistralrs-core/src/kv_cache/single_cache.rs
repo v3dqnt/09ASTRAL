@@ -1,6 +1,6 @@
-use candle_core::{Result, Tensor};
+use candle_core::{DType, Result, Tensor, D};
 
-use super::NormalCache;
+use super::{quant, NormalCache};
 
 #[derive(Debug, Clone)]
 pub struct SingleCacheSnapshot {
@@ -18,6 +18,8 @@ pub struct SingleCache {
     pub current_seq_len: usize,
     pub capacity_seq_len: usize,
     pub max_seq_len: usize,
+    // dtype handed back from a quantized (u8) cache
+    pub out_dtype: Option<DType>,
 }
 
 impl SingleCache {
@@ -28,6 +30,7 @@ impl SingleCache {
             current_seq_len: 0,
             max_seq_len,
             capacity_seq_len,
+            out_dtype: None,
         }
     }
 
@@ -48,11 +51,21 @@ impl SingleCache {
     }
 
     pub fn current_data(&self) -> Result<Option<Tensor>> {
-        let data = match self.all_data.as_ref() {
-            None => None,
-            Some(d) => Some(d.narrow(self.dim, 0, self.current_seq_len)?),
-        };
-        Ok(data)
+        match self.current_raw()? {
+            Some(d) if d.dtype() == DType::U8 => Ok(Some(quant::dequantize(
+                &d,
+                self.out_dtype.unwrap_or(DType::F32),
+            )?)),
+            d => Ok(d),
+        }
+    }
+
+    /// Stored data without dequantizing, for moving caches between sequences.
+    pub fn current_raw(&self) -> Result<Option<Tensor>> {
+        self.all_data
+            .as_ref()
+            .map(|d| d.narrow(self.dim, 0, self.current_seq_len))
+            .transpose()
     }
 
     pub fn snapshot(&self) -> SingleCacheSnapshot {
@@ -100,6 +113,14 @@ impl SingleCache {
     }
 
     pub fn append(&mut self, src: &Tensor) -> Result<()> {
+        let quantized;
+        let src = if quant::packed_dim(src.dim(D::Minus1)?).is_some() {
+            self.out_dtype = Some(src.dtype());
+            quantized = quant::quantize(src)?;
+            &quantized
+        } else {
+            src
+        };
         let seq_len = src.dim(self.dim)?;
         // This doesn't seem very idiomatic but because the creation can fail, it's tricky to use
         // self.all_data.get_or_insert_with.
