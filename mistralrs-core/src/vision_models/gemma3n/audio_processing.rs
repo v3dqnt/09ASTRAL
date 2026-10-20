@@ -188,6 +188,7 @@ impl AudioProcessor {
         // Create mel filterbank
         let mel_filters =
             self.create_mel_filterbank(self.feature_size, n_fft, sample_rate as f32)?;
+        let mel_filters = crate::vision_models::mel_spans(&mel_filters);
 
         // Process frames
         // We replicate the exact frame logic used in
@@ -239,13 +240,8 @@ impl AudioProcessor {
 
             // === Mel filter-bank projection ===
             let mut mel_frame = vec![0.0f32; self.feature_size];
-            for (mel_idx, filter) in mel_filters.iter().enumerate() {
-                let mut sum = 0.0f32;
-                for (freq_idx, &coeff) in filter.iter().enumerate() {
-                    if freq_idx < magnitude.len() {
-                        sum += magnitude[freq_idx] * coeff;
-                    }
-                }
+            for (mel_idx, &filter) in mel_filters.iter().enumerate() {
+                let sum = crate::vision_models::mel_dot(filter, &magnitude);
                 mel_frame[mel_idx] = (sum.max(self.mel_floor)).ln();
             }
 

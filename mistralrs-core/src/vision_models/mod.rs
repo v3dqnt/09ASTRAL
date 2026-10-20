@@ -207,6 +207,32 @@ pub(crate) fn text_decode_position_ids_from_context(
     ))
 }
 
+/// Mel filters are triangles, so precompute each one's nonzero span instead of multiplying the zeros every frame.
+pub(crate) fn mel_spans(filters: &[Vec<f32>]) -> Vec<(usize, &[f32])> {
+    filters
+        .iter()
+        .map(|filter| {
+            let start = filter
+                .iter()
+                .position(|&c| c != 0.0)
+                .unwrap_or(filter.len());
+            let end = filter
+                .iter()
+                .rposition(|&c| c != 0.0)
+                .map_or(start, |end| end + 1);
+            (start, &filter[start..end])
+        })
+        .collect()
+}
+
+pub(crate) fn mel_dot((start, weights): (usize, &[f32]), spectrum: &[f32]) -> f32 {
+    weights
+        .iter()
+        .zip(spectrum.iter().skip(start))
+        .map(|(&coeff, &value)| value * coeff)
+        .sum()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

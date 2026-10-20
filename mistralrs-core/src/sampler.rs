@@ -632,6 +632,49 @@ fn top_p_cutoff(top_p: f32, kept_probs: impl Iterator<Item = f32>) -> f32 {
     top_p * kept_probs.sum::<f32>()
 }
 
+fn exp_bucket(p: f32) -> usize {
+    (p.to_bits() >> 23) as usize & 0xff
+}
+
+/// Top-k set (sorted desc) cut to the smallest prefix reaching `top_p` of its mass.
+fn nucleus(probs: &mut [f32], k: usize, top_p: f32) -> Vec<(u32, f32)> {
+    let (mut top, cutoff) = if k < probs.len() {
+        let top = partial_sort_top_k(probs, k, false);
+        let cutoff = top_p_cutoff(top_p, top.iter().map(|(_, p)| *p));
+        (top, cutoff)
+    } else {
+        // Bucket by exponent so only tokens above the cutoff bucket get sorted, not the whole vocab
+        let mut mass = [0.0f32; 256];
+        for &p in probs.iter() {
+            mass[exp_bucket(p)] += p;
+        }
+        let cutoff = top_p_cutoff(top_p, mass.iter().copied());
+        let mut acc = 0.0;
+        let floor = (0..256)
+            .rev()
+            .find(|&b| {
+                acc += mass[b];
+                acc >= cutoff
+            })
+            .unwrap_or(0);
+        let mut top: Vec<(u32, f32)> = (0..probs.len() as u32)
+            .map(|i| (i, probs[i as usize]))
+            .filter(|(_, p)| exp_bucket(*p) >= floor)
+            .collect();
+        top.sort_unstable_by(cmp_desc_by_prob);
+        (top, cutoff)
+    };
+    let mut cumsum = 0.0f32;
+    if let Some(len) = top.iter().position(|(_, p)| {
+        let done = cumsum >= cutoff;
+        cumsum += p;
+        done
+    }) {
+        top.truncate(len);
+    }
+    top
+}
+
 #[cfg(all(feature = "cuda", test))]
 fn weighted_index_from_unit_f32(weights: &[f32], unit: f32) -> Result<usize> {
     if weights.is_empty() || !unit.is_finite() || !(0.0..1.0).contains(&unit) {
@@ -1193,56 +1236,10 @@ impl Sampler {
         &self,
         logits: Tensor,
         return_logprobs: bool,
-        top_k: i64,
-        top_p: f32,
-        min_p: f32,
     ) -> Result<Logprobs> {
-        let mut probs: Vec<f32> = logits.to_vec1()?;
-        let reporting_probs = probs.clone();
-
-        // Determine how many elements we need for partial sort
-        let k = if top_k > 0 {
-            top_k as usize
-        } else {
-            probs.len()
-        };
-
-        // Get sorted top-k indices with partial sort, zeroing out rest
-        let idx_probs = partial_sort_top_k(&mut probs, k, true);
-
-        // TOP P
-        // top-p sampling (or "nucleus sampling") samples from the smallest set of
-        // tokens that exceed probability top_p. This way we never sample tokens that
-        // have very low probabilities and are less likely to go "off the rails".
-
-        // Clamp smaller probabilities to zero.
-        let cutoff = top_p_cutoff(top_p, idx_probs.iter().map(|(_, p)| *p));
-        let mut cumsum = 0.;
-        for (index, prob) in &idx_probs {
-            if cumsum >= cutoff {
-                probs[*index as usize] = 0.0;
-            } else {
-                cumsum += prob;
-            }
-        }
-
-        // Get max_p from first sorted element
-        let max_p = idx_probs.first().map(|(_, p)| *p).unwrap_or(0.0);
-
-        // MIN P
-        // min-p sampling samples from the tokens whose prob are greater than
-        // (max prob of token in dist) * min_p
-
-        // Clamp smaller probabilities to zero.
-        let min_p_threshold = max_p * min_p;
-        for (index, prob) in &idx_probs {
-            if min_p_threshold >= *prob {
-                probs[*index as usize] = 0.0;
-            }
-        }
-
-        // Find argmax directly on the Vec (O(n) scan, no Tensor creation)
-        let next_token = argmax_f32(&probs)?;
+        let reporting_probs: Vec<f32> = logits.to_vec1()?;
+        // top-k/top-p/min-p never drop the most likely token, so the filtered argmax is the plain argmax
+        let next_token = argmax_f32(&reporting_probs)?;
         let logprob = reporting_probs[next_token as usize].ln();
 
         let top_logprobs = if return_logprobs {
@@ -1739,36 +1736,43 @@ impl Sampler {
     }
 
     fn filter_top_kp_min_p(&self, probs: &mut [f32]) {
+        let n = probs.len();
         let k = if self.top_k > 0 {
-            self.top_k as usize
+            (self.top_k as usize).min(n)
         } else {
-            probs.len()
+            n
         };
-
-        let idx_probs = partial_sort_top_k(probs, k, true);
-
-        if self.top_p > 0.0 && self.top_p < 1.0 {
-            let cutoff = top_p_cutoff(self.top_p as f32, idx_probs.iter().map(|(_, p)| *p));
-            let mut cumsum = 0.0f32;
-            for (index, prob) in &idx_probs {
-                if cumsum >= cutoff {
-                    probs[*index as usize] = 0.0;
-                } else {
-                    cumsum += prob;
+        let kept = if self.top_p > 0.0 && self.top_p < 1.0 {
+            Some(nucleus(probs, k, self.top_p as f32))
+        } else if k < n {
+            Some(partial_sort_top_k(probs, k, false))
+        } else {
+            None
+        };
+        let min_p = if self.min_p > 0.0 && self.min_p < 1.0 {
+            self.min_p as f32
+        } else {
+            0.0
+        };
+        match kept {
+            Some(kept) => {
+                let threshold = kept.first().map_or(0.0, |(_, p)| *p) * min_p;
+                probs.fill(0.0);
+                for (index, prob) in kept {
+                    if prob > threshold {
+                        probs[index as usize] = prob;
+                    }
                 }
             }
-        }
-
-        if self.min_p <= 0.0 || self.min_p >= 1.0 {
-            return;
-        }
-
-        let max_p = idx_probs.first().map(|(_, p)| *p).unwrap_or(0.0);
-        let min_p_threshold = max_p * self.min_p as f32;
-        for (index, prob) in &idx_probs {
-            if min_p_threshold >= *prob {
-                probs[*index as usize] = 0.0;
+            None if min_p > 0.0 => {
+                let threshold = probs.iter().copied().fold(0.0f32, f32::max) * min_p;
+                for prob in probs.iter_mut() {
+                    if *prob <= threshold {
+                        *prob = 0.0;
+                    }
+                }
             }
+            None => {}
         }
     }
 
@@ -1894,63 +1898,14 @@ impl Sampler {
         self.sample_multinomial(sampling_probs, reporting_probs, return_logprobs, rng)
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn sample_top_kp_min_p(
         &self,
         reporting_probs: &[f32],
-        top_k: i64,
-        top_p: f32,
-        min_p: f32,
         return_logprobs: bool,
         rng: Arc<Mutex<Isaac64Rng>>,
     ) -> Result<Logprobs> {
-        if top_k <= 0 && !(top_p > 0.0 && top_p < 1.0) && !(min_p > 0.0 && min_p < 1.0) {
-            return self.sample_multinomial(reporting_probs, reporting_probs, return_logprobs, rng);
-        }
         let mut sampling_probs = reporting_probs.to_vec();
-        // Determine how many elements we need for partial sort
-        let k = if top_k > 0 {
-            top_k as usize
-        } else {
-            sampling_probs.len()
-        };
-
-        // Get sorted top-k indices with partial sort, zeroing out rest
-        let idx_probs = partial_sort_top_k(&mut sampling_probs, k, true);
-
-        if top_p > 0.0 && top_p < 1.0 {
-            let cutoff = top_p_cutoff(top_p, idx_probs.iter().map(|(_, p)| *p));
-            let mut cumsum = 0.;
-            for (index, prob) in &idx_probs {
-                if cumsum >= cutoff {
-                    sampling_probs[*index as usize] = 0.0;
-                } else {
-                    cumsum += prob;
-                }
-            }
-        }
-
-        if min_p <= 0.0 || min_p >= 1.0 {
-            return self.sample_multinomial(&sampling_probs, reporting_probs, return_logprobs, rng);
-        }
-
-        // Get max_p from first sorted element
-        let max_p = idx_probs.first().map(|(_, p)| *p).unwrap_or(0.0);
-
-        // MIN P
-
-        // min-p sampling samples from the tokens whose prob are greater than
-        // (max prob of token in dist) * min_p
-
-        // Clamp smaller probabilities to zero.
-        let min_p_threshold = max_p * min_p;
-        for (index, prob) in &idx_probs {
-            if min_p_threshold >= *prob {
-                sampling_probs[*index as usize] = 0.0;
-            }
-        }
-
-        // Sample with clamped probabilities.
+        self.filter_top_kp_min_p(&mut sampling_probs);
         self.sample_multinomial(&sampling_probs, reporting_probs, return_logprobs, rng)
     }
 
@@ -1999,24 +1954,30 @@ impl Sampler {
 
             let mut generated_counts = vec![0.0f32; logits.len()];
             let mut seen = vec![false; logits.len()];
+            // only tokens in the context get penalized, so skip the full-vocab pass
+            let mut touched = Vec::new();
             for (idx, ctx) in context.iter().enumerate() {
                 // Llama 3.2 uses a hack triggering this error... we wouldn't want a weight on it anyway
                 if *ctx as usize >= logits.len() {
                     continue;
                 }
-                seen[*ctx as usize] = true;
+                if !seen[*ctx as usize] {
+                    seen[*ctx as usize] = true;
+                    touched.push(*ctx as usize);
+                }
                 if idx >= prompt_len {
                     generated_counts[*ctx as usize] += 1.0;
                 }
             }
 
-            for (token_id, logit) in logits.iter_mut().enumerate() {
+            for token_id in touched {
+                let logit = &mut logits[token_id];
                 let count = generated_counts[token_id];
                 *logit = *logit
                     - count * frequency_penalty
                     - if count > 0.0 { 1. } else { 0. } * presence_penalty;
 
-                if repetition_penalty != 1.0 && seen[token_id] {
+                if repetition_penalty != 1.0 {
                     if *logit > 0.0 {
                         *logit /= repetition_penalty;
                     } else {
@@ -2191,21 +2152,12 @@ impl Sampler {
                 None => self.sample_speculative_top_kp_min_p(
                     candle_nn::ops::softmax_last_dim(&logits)?,
                     return_logprobs,
-                    self.top_k,
-                    self.top_p as f32,
-                    self.min_p as f32,
                 )?,
                 Some(temperature) => {
                     let logits = (&logits / temperature)?;
                     let probs = candle_nn::ops::softmax_last_dim(&logits)?;
 
-                    self.sample_speculative_top_kp_min_p(
-                        probs,
-                        return_logprobs,
-                        self.top_k,
-                        self.top_p as f32,
-                        self.min_p as f32,
-                    )?
+                    self.sample_speculative_top_kp_min_p(probs, return_logprobs)?
                 }
             }
         } else {
@@ -2216,14 +2168,7 @@ impl Sampler {
                     let probs = candle_nn::ops::softmax_last_dim(&logits)?;
                     let probs: Vec<f32> = probs.to_vec1()?;
 
-                    self.sample_top_kp_min_p(
-                        &probs,
-                        self.top_k,
-                        self.top_p as f32,
-                        self.min_p as f32,
-                        return_logprobs,
-                        rng,
-                    )?
+                    self.sample_top_kp_min_p(&probs, return_logprobs, rng)?
                 }
             }
         };
@@ -2294,6 +2239,30 @@ mod tests {
 
         assert_eq!(selected, vec![(1, 0.5), (2, 0.5)]);
         assert_eq!(probs, vec![0.0, 0.5, 0.5, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn nucleus_matches_full_sort() {
+        use rand::{Rng, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0);
+        let logits: Vec<f32> = (0..50_000).map(|_| rng.random::<f32>() * 12.0).collect();
+        let max = logits.iter().copied().fold(f32::MIN, f32::max);
+        let exp: Vec<f32> = logits.iter().map(|l| (l - max).exp()).collect();
+        let total: f32 = exp.iter().sum();
+        let mut probs: Vec<f32> = exp.iter().map(|e| e / total).collect();
+
+        // reference: full sort with the cutoff accumulated in f64
+        let mut sorted = partial_sort_top_k(&mut probs.clone(), probs.len(), false);
+        let cutoff = 0.9 * sorted.iter().map(|(_, p)| *p as f64).sum::<f64>();
+        let mut cumsum = 0.0f64;
+        sorted.retain(|(_, p)| {
+            let keep = cumsum < cutoff;
+            cumsum += *p as f64;
+            keep
+        });
+
+        let got = super::nucleus(&mut probs, 50_000, 0.9);
+        assert_eq!(got, sorted);
     }
 
     #[test]

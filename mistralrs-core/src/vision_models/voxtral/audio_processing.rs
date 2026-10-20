@@ -144,6 +144,7 @@ impl VoxtralAudioProcessor {
             .collect();
 
         let mel_filters = self.create_mel_filterbank(n_fft)?;
+        let mel_filters = crate::vision_models::mel_spans(&mel_filters);
 
         let mut planner = FftPlanner::<f32>::new();
         let fft = planner.plan_fft_forward(n_fft);
@@ -165,13 +166,8 @@ impl VoxtralAudioProcessor {
             let power: Vec<f32> = buf[..n_freqs].iter().map(|c| c.norm_sqr()).collect();
 
             let mut mel_frame = vec![0.0f32; self.num_mel_bins];
-            for (mel_idx, filter) in mel_filters.iter().enumerate() {
-                let mut sum = 0.0f32;
-                for (freq_idx, &coeff) in filter.iter().enumerate() {
-                    if freq_idx < power.len() {
-                        sum += power[freq_idx] * coeff;
-                    }
-                }
+            for (mel_idx, &filter) in mel_filters.iter().enumerate() {
+                let sum = crate::vision_models::mel_dot(filter, &power);
                 let log_val = sum.max(1e-10).log10();
                 let clamped = log_val.max(log_mel_floor);
                 mel_frame[mel_idx] = (clamped + 4.0) / 4.0;
