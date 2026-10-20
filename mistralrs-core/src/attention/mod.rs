@@ -62,6 +62,8 @@ pub(crate) use backends::{
 
 /// Chunk size for attention computation to avoid OOM on long sequences
 pub(crate) const ATTENTION_CHUNK_SIZE: usize = 1024;
+/// Caps the eager score matrix per query chunk (batch * heads * rows * kv_len) so long prompts don't scale it with kv_len.
+const ATTENTION_CHUNK_MAX_SCORES: usize = 1 << 27;
 pub(crate) const FLASH_ATTN_NATIVE_MAX_GQA_GROUP: usize = 8;
 
 #[cfg(any(
@@ -117,8 +119,9 @@ fn eager_attention_mask_with_shape(
             });
         }
     }
-    Tensor::from_vec(mask, (query_len, key_len), device)
-        .and_then(|mask| mask.to_dtype(dtype))
+    Tensor::from_vec(mask, (query_len, key_len), &Device::Cpu)?
+        .to_dtype(dtype)?
+        .to_device(device)
         .map(Some)
 }
 
@@ -174,18 +177,20 @@ pub(crate) fn chunked_attention_with_offset<F>(
 where
     F: Fn(&Tensor, &Tensor, &Tensor, Option<&Tensor>, usize) -> Result<Tensor>,
 {
-    let seq_len = q.dim(2)?;
+    let (b_sz, n_heads, seq_len, _) = q.dims4()?;
+    let chunk_size = (ATTENTION_CHUNK_MAX_SCORES / (b_sz * n_heads * k.dim(2)?).max(1))
+        .clamp(1, ATTENTION_CHUNK_SIZE);
 
-    if seq_len <= ATTENTION_CHUNK_SIZE {
+    if seq_len <= chunk_size {
         return attention_fn(q, k, v, mask, 0);
     }
 
-    let num_chunks = seq_len.div_ceil(ATTENTION_CHUNK_SIZE);
+    let num_chunks = seq_len.div_ceil(chunk_size);
     let mut attn_chunks = Vec::with_capacity(num_chunks);
 
     for chunk_idx in 0..num_chunks {
-        let offset = chunk_idx * ATTENTION_CHUNK_SIZE;
-        let chunk_len = ATTENTION_CHUNK_SIZE.min(seq_len - offset);
+        let offset = chunk_idx * chunk_size;
+        let chunk_len = chunk_size.min(seq_len - offset);
 
         // Extract query chunk
         let q_chunk = q.narrow(2, offset, chunk_len)?;
@@ -719,6 +724,30 @@ impl Sdpa {
 mod tests {
     use super::*;
     use candle_core::{Result as CandleResult, D};
+
+    #[test]
+    fn naive_sdpa_chunked_by_score_budget_matches_unchunked() -> CandleResult<()> {
+        // 64 heads * 2100 keys forces query chunks smaller than ATTENTION_CHUNK_SIZE
+        let (h, seq, d) = (64, 2100, 16);
+        let q = Tensor::randn(0f32, 1., (1, h, seq, d), &Device::Cpu)?;
+        let k = Tensor::randn(0f32, 1., (1, h, seq, d), &Device::Cpu)?;
+        let v = Tensor::randn(0f32, 1., (1, h, seq, d), &Device::Cpu)?;
+        let mask = eager_attention_mask(seq, seq, true, None, DType::F32, &Device::Cpu)?.unwrap();
+        let params = SdpaParams {
+            n_kv_groups: 1,
+            softcap: None,
+            softmax_scale: 0.25,
+            sliding_window: None,
+            sinks: None,
+        };
+        let got = naive_sdpa(&q, &k, &v, Some(&mask), &params)?;
+        let att = (q.matmul(&k.t()?)? * 0.25)?.broadcast_add(&mask)?;
+        let want = candle_nn::ops::softmax_last_dim(&att)?.matmul(&v)?;
+        let diff = (got - want)?.abs()?.max_all()?.to_scalar::<f32>()?;
+        // same ~2e-3 gap shows up unchunked (seq < chunk), it comes from the matmul kernels
+        assert!(diff < 1e-2, "max diff {diff}");
+        Ok(())
+    }
 
     const EPS: f32 = 1e-4;
 

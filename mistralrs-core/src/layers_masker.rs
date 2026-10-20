@@ -77,14 +77,6 @@ impl PastKvLenCache for Vec<Option<(Tensor, Tensor)>> {
 }
 
 impl CausalMasker {
-    fn make_mask(&self, tgt_len: usize, past_kv_len: usize, device: &Device) -> Result<Tensor> {
-        let offset = tgt_len + past_kv_len;
-        let mask: Vec<_> = (0..tgt_len)
-            .flat_map(|i| (0..offset).map(move |j| u8::from(j + tgt_len > i + offset)))
-            .collect();
-        Tensor::from_slice(&mask, (tgt_len, offset), device)
-    }
-
     fn make_mask_chunked(
         &self,
         tgt_len: usize,
@@ -147,7 +139,10 @@ impl CausalMasker {
                 })
             })
             .collect();
-        Tensor::from_slice(&mask, (tgt_len, total_kv_len), device)?.to_dtype(dtype)
+        // Cast on the host so the device only ever holds the final-dtype mask.
+        Tensor::from_vec(mask, (tgt_len, total_kv_len), &Device::Cpu)?
+            .to_dtype(dtype)?
+            .to_device(device)
     }
 
     /// Expands a mask from (bs, seq_len) to (bs, 1, tgt_len, seq_len)
@@ -210,21 +205,14 @@ impl CausalMasker {
             return Ok(crate::attention::AttentionMask::CausalFlash);
         }
 
-        let mask = if let Some(sw) = cfg.sliding_window {
-            self.make_swa_mask(tgt_len, past_kv_len, sw, input_ids.device(), dtype)?
-        } else {
-            let causal = self
-                .make_mask(tgt_len, past_kv_len, input_ids.device())?
-                .to_dtype(DType::U8)?;
-            let zero = Tensor::new(0.0f32, input_ids.device())?;
-            masked_fill(
-                &zero
-                    .to_dtype(dtype)?
-                    .broadcast_as((causal.dims()[0], causal.dims()[1]))?,
-                &causal,
-                f32::NEG_INFINITY,
-            )?
-        };
+        let sliding_window = cfg.sliding_window.unwrap_or(usize::MAX);
+        let mask = self.make_swa_mask(
+            tgt_len,
+            past_kv_len,
+            sliding_window,
+            input_ids.device(),
+            dtype,
+        )?;
 
         Ok(crate::attention::AttentionMask::Custom(mask))
     }
