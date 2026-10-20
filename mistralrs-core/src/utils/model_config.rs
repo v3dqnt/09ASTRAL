@@ -131,15 +131,8 @@ pub struct Config<Q: QuantParams, A: MaybeAdapter> {
     pub adapter: A,
 }
 
-// NOTE: Variantly used for `.expect_quantized()` / `.expect_adapted()` methods
-// `where` clause required due to bug with inline bounds:
-// https://github.com/luker-os/variantly/pull/16
 #[allow(clippy::large_enum_variant)]
-#[derive(variantly::Variantly)]
-pub enum ModelParams<'a, Q>
-where
-    Q: QuantParams,
-{
+pub enum ModelParams<'a, Q: QuantParams> {
     Quantized(Config<Q, NoAdapter>),
     Adapted(Config<Q, Adapter<'a>>),
 }
@@ -153,6 +146,20 @@ impl<'a, Q: QuantParams> ModelParams<'a, Q> {
         match adapter {
             None => Self::Quantized((quant, NoAdapter {}).into()),
             Some(a) => Self::Adapted((quant, a).into()),
+        }
+    }
+
+    pub fn expect_quantized(self, msg: &str) -> Config<Q, NoAdapter> {
+        match self {
+            Self::Quantized(c) => c,
+            Self::Adapted(_) => panic!("{msg}"),
+        }
+    }
+
+    pub fn expect_adapted(self, msg: &str) -> Config<Q, Adapter<'a>> {
+        match self {
+            Self::Adapted(c) => c,
+            Self::Quantized(_) => panic!("{msg}"),
         }
     }
 }

@@ -15,9 +15,9 @@ use crate::{
     utils::progress::NiceProgressBar,
 };
 use candle_core::{DType, Device, Module, Result, Tensor, D};
+use indicatif::ProgressIterator;
 use mistralrs_quant::{QuantMethod, ShardedVarBuilder};
 use std::{collections::HashMap, sync::Arc};
-use tqdm::Iter;
 use tracing::info;
 
 use crate::{
@@ -444,7 +444,7 @@ impl Model {
         if xlora_config.is_none() && preload_adapters.is_none() {
             // We are now a LoRA model so we must merge the weights
             info!("Merging LoRA adapters.");
-            for layer in layers.iter_mut().tqdm() {
+            for layer in layers.iter_mut().progress() {
                 Arc::get_mut(&mut layer.self_attn.qkv_proj)
                     .unwrap()
                     .merge_weights()?;

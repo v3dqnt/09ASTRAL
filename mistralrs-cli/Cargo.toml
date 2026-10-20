@@ -31,7 +31,6 @@ clap = { workspace = true }
 clap_complete = "4.5"
 tokio = { workspace = true }
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -48,12 +47,11 @@ mime_guess = { workspace = true }
 tower-http = { workspace = true, features = ["fs"] }
 uuid = { workspace = true, features = ["v4"] }
 chrono = { workspace = true }
-futures-util = { workspace = true }
 image = { workspace = true }
 comfy-table = "7"
 dirs = { workspace = true }
 walkdir = { workspace = true }
-crossterm = "0.28"
+crossterm = "0.29"
 fuzzy-matcher = "0.3"
 
 [features]
