@@ -121,6 +121,8 @@ fn response_stop_sequence(reason: Option<StopReason>, hidden_stop: Option<&str>)
 
 // With a think-tag parser, only content outside the think block counts as tool text.
 fn tool_detection_text(seq: &Sequence, hidden_stop: Option<&str>) -> Option<String> {
+    // every caller only reads this through tool_call_state, and building it copies the whole response
+    seq.tool_call_state.as_ref()?;
     let text = if seq.reasoning_mode().is_some() {
         seq.get_response_content()
     } else {

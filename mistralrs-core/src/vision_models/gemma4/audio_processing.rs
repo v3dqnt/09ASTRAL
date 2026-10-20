@@ -257,6 +257,7 @@ impl AudioProcessor {
         let num_frames = (waveform.len() - frame_size_for_unfold) / self.hop_length + 1;
         let mut planner = FftPlanner::<f32>::new();
         let fft = planner.plan_fft_forward(self.fft_length);
+        let mel_filters = crate::vision_models::mel_spans(&self.mel_filters);
         let mut mel_features = Vec::with_capacity(num_frames);
         let mut valid_mask = Vec::with_capacity(num_frames);
 
@@ -294,11 +295,8 @@ impl AudioProcessor {
                 .collect::<Vec<_>>();
 
             let mut mel_frame = vec![0.0f32; self.feature_size];
-            for (mel_idx, filter) in self.mel_filters.iter().enumerate() {
-                let mut sum = 0.0f32;
-                for (freq_idx, &coeff) in filter.iter().enumerate() {
-                    sum += magnitude[freq_idx] * coeff;
-                }
+            for (mel_idx, &filter) in mel_filters.iter().enumerate() {
+                let sum = crate::vision_models::mel_dot(filter, &magnitude);
                 let mut value = (sum + self.mel_floor).ln();
                 if let Some(mean) = self
                     .per_bin_mean

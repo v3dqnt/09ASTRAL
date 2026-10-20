@@ -1164,6 +1164,7 @@ impl Phi4MMInputsProcessor {
             AUDIO_MEL_SAMPLE_RATE as f32,
             AUDIO_MEL_FMAX_HZ,
         )?;
+        let mel_filters = crate::vision_models::mel_spans(&mel_filters);
 
         let n_batch = (wav.len() - win_length) / hop_length + 1;
         let mut mel_features = Vec::with_capacity(n_batch);
@@ -1200,12 +1201,8 @@ impl Phi4MMInputsProcessor {
                 .map(|value| value.norm_sqr())
                 .collect::<Vec<_>>();
             let mut mel_frame = vec![0.; AUDIO_FEATURE_SIZE];
-            for (mel_index, filter) in mel_filters.iter().enumerate() {
-                let power = power_spectrum
-                    .iter()
-                    .zip(filter)
-                    .map(|(&power, &coefficient)| power * coefficient)
-                    .sum::<f32>();
+            for (mel_index, &filter) in mel_filters.iter().enumerate() {
+                let power = crate::vision_models::mel_dot(filter, &power_spectrum);
                 mel_frame[mel_index] = power.max(1.).ln();
             }
             mel_features.push(mel_frame);

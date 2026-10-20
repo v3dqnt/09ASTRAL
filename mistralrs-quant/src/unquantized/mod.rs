@@ -259,114 +259,50 @@ impl QuantMethod for UnquantLinear {
     }
 
     fn gather_forward_raw(&self, a: &Tensor, indices: &Tensor) -> Result<Tensor> {
-        // Weights are [num_experts, out_features, in_features]
-        // For Metal path:
-        //   - a: (b_size, seq_len, 1, 1, hidden_dim) - 5D
-        //   - indices: (b_size, seq_len, num_experts_per_tok) - 3D
-        // For CUDA path:
-        //   - a: (num_tokens, 1, hidden_dim) - 3D
-        //   - indices: (num_tokens, num_experts_per_tok) - 2D
-
+        // Weights are [num_experts, out_features, in_features]; every input layout flattens to one row per route
         let w = &self.w;
         let (_num_experts, out_features, _in_features) = w.dims3()?;
 
-        let result = match a.dims() {
+        let (rows, out_shape): (Tensor, Vec<usize>) = match a.dims() {
             // Metal path: 5D input (b_size, seq_len, 1, 1, hidden_dim)
             &[b_size, seq_len, 1, 1, hidden_dim] => {
-                let (_b, _s, num_experts_per_tok) = indices.dims3()?;
-                // Flatten indices to select experts
-                let flat_indices = indices.reshape((b_size * seq_len * num_experts_per_tok,))?;
-
-                // Select expert weights: [b*s*k, out_features, in_features]
-                let selected_w = w.index_select(&flat_indices, 0)?;
-
-                // Reshape input: [b*s, hidden_dim]
-                let a_flat = a.reshape((b_size * seq_len, hidden_dim))?;
-
-                // For each token, we need to compute with each selected expert
-                // Broadcast a to match: [b*s, 1, hidden_dim] -> [b*s, k, hidden_dim]
-                let a_expanded = a_flat
-                    .unsqueeze(1)?
-                    .broadcast_as((b_size * seq_len, num_experts_per_tok, hidden_dim))?
-                    .reshape((b_size * seq_len * num_experts_per_tok, hidden_dim))?;
-
-                // Matmul: [b*s*k, hidden_dim] @ [b*s*k, hidden_dim, out_features] -> [b*s*k, out_features]
-                let result = a_expanded
-                    .unsqueeze(1)?
-                    .matmul(&selected_w.transpose(1, 2)?)?
-                    .squeeze(1)?;
-
-                // Reshape back to [b, s, k, out_features]
-                result.reshape((b_size, seq_len, num_experts_per_tok, out_features))
+                let (_b, _s, k) = indices.dims3()?;
+                let rows = a
+                    .reshape((b_size * seq_len, 1, hidden_dim))?
+                    .broadcast_as((b_size * seq_len, k, hidden_dim))?
+                    .reshape((b_size * seq_len * k, hidden_dim))?;
+                (rows, vec![b_size, seq_len, k, out_features])
             }
             // CUDA path: 3D input (num_tokens, 1, hidden_dim)
             &[num_tokens, 1, hidden_dim] => {
-                let (_, num_experts_per_tok) = indices.dims2()?;
-
-                // Flatten indices
-                let flat_indices = indices.reshape((num_tokens * num_experts_per_tok,))?;
-
-                // Select expert weights: [n*k, out_features, in_features]
-                let selected_w = w.index_select(&flat_indices, 0)?;
-
-                // Broadcast input: [n, 1, hidden] -> [n, k, hidden] -> [n*k, hidden]
-                let a_expanded = a
-                    .broadcast_as((num_tokens, num_experts_per_tok, hidden_dim))?
-                    .reshape((num_tokens * num_experts_per_tok, hidden_dim))?;
-
-                // Matmul: [n*k, hidden] @ [n*k, hidden, out] -> [n*k, out]
-                let result = a_expanded
-                    .unsqueeze(1)?
-                    .matmul(&selected_w.transpose(1, 2)?)?
-                    .squeeze(1)?;
-
-                // Reshape to [n, k, out]
-                result.reshape((num_tokens, num_experts_per_tok, out_features))
+                let (_, k) = indices.dims2()?;
+                let rows = a
+                    .broadcast_as((num_tokens, k, hidden_dim))?
+                    .reshape((num_tokens * k, hidden_dim))?;
+                (rows, vec![num_tokens, k, out_features])
             }
-            &[num_tokens, num_experts_per_tok, hidden_dim] => {
-                let (indices_num_tokens, indices_num_experts_per_tok) = indices.dims2()?;
-                if num_tokens != indices_num_tokens
-                    || num_experts_per_tok != indices_num_experts_per_tok
-                {
+            &[num_tokens, k, hidden_dim] => {
+                if indices.dims2()? != (num_tokens, k) {
                     candle_core::bail!(
                         "UnquantLinear::gather_forward: input shape {:?} does not match indices shape {:?}",
                         a.dims(),
                         indices.dims()
                     );
                 }
-
-                let flat_indices = indices.reshape((num_tokens * num_experts_per_tok,))?;
-                let selected_w = w.index_select(&flat_indices, 0)?;
-                let a_flat = a.reshape((num_tokens * num_experts_per_tok, hidden_dim))?;
-
-                let result = a_flat
-                    .unsqueeze(1)?
-                    .matmul(&selected_w.transpose(1, 2)?)?
-                    .squeeze(1)?;
-
-                result.reshape((num_tokens, num_experts_per_tok, out_features))
+                let rows = a.reshape((num_tokens * k, hidden_dim))?;
+                (rows, vec![num_tokens, k, out_features])
             }
             // Metal path stage 2: per-slot inputs (b, s, k, hidden) from a prior gather's output
-            &[b_size, seq_len, num_experts_per_tok, hidden_dim] => {
-                let (ib, is, ik) = indices.dims3()?;
-                if (b_size, seq_len, num_experts_per_tok) != (ib, is, ik) {
+            &[b_size, seq_len, k, hidden_dim] => {
+                if indices.dims3()? != (b_size, seq_len, k) {
                     candle_core::bail!(
                         "UnquantLinear::gather_forward: input shape {:?} does not match indices shape {:?}",
                         a.dims(),
                         indices.dims()
                     );
                 }
-                let flat = b_size * seq_len * num_experts_per_tok;
-                let flat_indices = indices.reshape((flat,))?;
-                let selected_w = w.index_select(&flat_indices, 0)?;
-                let a_flat = a.reshape((flat, hidden_dim))?;
-
-                let result = a_flat
-                    .unsqueeze(1)?
-                    .matmul(&selected_w.transpose(1, 2)?)?
-                    .squeeze(1)?;
-
-                result.reshape((b_size, seq_len, num_experts_per_tok, out_features))
+                let rows = a.reshape((b_size * seq_len * k, hidden_dim))?;
+                (rows, vec![b_size, seq_len, k, out_features])
             }
             dims => {
                 candle_core::bail!(
@@ -374,7 +310,20 @@ impl QuantMethod for UnquantLinear {
                     dims
                 );
             }
-        }?;
+        };
+
+        let flat_indices = indices.flatten_all()?;
+        let result = if a.device().is_cpu() {
+            grouped_expert_matmul(&rows, &flat_indices, w.dim(0)?, |e, xs| {
+                xs.matmul(&w.get(e)?.t()?)
+            })?
+        } else {
+            // [routes, 1, hidden] @ [routes, hidden, out]
+            rows.unsqueeze(1)?
+                .matmul(&w.index_select(&flat_indices, 0)?.transpose(1, 2)?)?
+                .squeeze(1)?
+        };
+        let result = result.reshape(out_shape)?;
         self.add_gather_bias(result, indices)
     }
 
@@ -687,6 +636,36 @@ impl QuantizedSerde for UnquantLinear {
     }
 }
 
+/// Runs each routed expert once over its rows (`rows[i]` goes to expert `flat_indices[i]`), so no per-route weight copy.
+pub(crate) fn grouped_expert_matmul(
+    rows: &Tensor,
+    flat_indices: &Tensor,
+    num_experts: usize,
+    expert_matmul: impl Fn(usize, &Tensor) -> Result<Tensor>,
+) -> Result<Tensor> {
+    let ids = flat_indices.to_dtype(DType::U32)?.to_vec1::<u32>()?;
+    let mut by_expert = vec![Vec::new(); num_experts];
+    for (row, &expert) in ids.iter().enumerate() {
+        by_expert[expert as usize].push(row as u32);
+    }
+    let mut outs = Vec::new();
+    let mut inverse = vec![0u32; ids.len()];
+    let mut next = 0u32;
+    for (expert, expert_rows) in by_expert.iter().enumerate() {
+        if expert_rows.is_empty() {
+            continue;
+        }
+        let idx = Tensor::new(expert_rows.as_slice(), rows.device())?;
+        outs.push(expert_matmul(expert, &rows.index_select(&idx, 0)?)?);
+        for &row in expert_rows {
+            inverse[row as usize] = next;
+            next += 1;
+        }
+    }
+    let inverse = Tensor::new(inverse, rows.device())?;
+    Tensor::cat(&outs, 0)?.index_select(&inverse, 0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -704,6 +683,27 @@ mod tests {
         <UnquantLinear as QuantMethod>::new(QuantMethodConfig::Unquantized(Linear::new(
             weight, bias,
         )))
+    }
+
+    #[test]
+    fn grouped_expert_matmul_matches_per_route_weights() -> Result<()> {
+        let device = Device::Cpu;
+        let w = Tensor::randn(0f32, 1., (8, 16, 32), &device)?;
+        let rows = Tensor::randn(0f32, 1., (12, 32), &device)?;
+        let ids = Tensor::new(&[3u32, 0, 7, 3, 3, 1, 0, 5, 7, 2, 3, 6], &device)?;
+
+        let reference = rows
+            .unsqueeze(1)?
+            .matmul(&w.index_select(&ids, 0)?.transpose(1, 2)?)?
+            .squeeze(1)?;
+        let grouped = grouped_expert_matmul(&rows, &ids, 8, |e, xs| xs.matmul(&w.get(e)?.t()?))?;
+
+        let max_err = (reference - grouped)?
+            .abs()?
+            .max_all()?
+            .to_scalar::<f32>()?;
+        assert!(max_err < 1e-5, "max_err {max_err}");
+        Ok(())
     }
 
     #[test]

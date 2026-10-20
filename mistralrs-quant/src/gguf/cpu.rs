@@ -3,11 +3,11 @@
 //! This dequantizes the weights and delegates to UnquantLinear's gather_forward.
 
 use candle_core::{
-    quantized::{QMatMul, QTensor},
-    Result, Tensor,
+    quantized::{QMatMul, QStorage, QTensor},
+    DType, Device, Module, Result, Tensor,
 };
 use candle_nn::Linear;
-use std::sync::Arc;
+use std::{borrow::Cow, sync::Arc};
 
 use crate::{QuantMethod, QuantMethodConfig, UnquantLinear};
 
@@ -58,7 +58,12 @@ pub fn qtensor_indexed_moe_forward(
             _ => (x.clone(), ids.clone(), None),
         };
         if let Some(shape) = out_shape.filter(|_| x3.rank() == 3 && ids2.rank() == 2) {
-            if let Some(out) = qtensor.indexed_gemv(&x3, &ids2)? {
+            let out = match qtensor.indexed_gemv(&x3, &ids2)? {
+                Some(out) => Some(out),
+                None if x3.device().is_cpu() => Some(routed_qmatmul(qtensor, &x3, &ids2)?),
+                None => None,
+            };
+            if let Some(out) = out {
                 return if shape.is_empty() {
                     Ok(out)
                 } else {
@@ -78,6 +83,30 @@ pub fn qtensor_indexed_moe_forward(
     let unquant = UnquantLinear::new(QuantMethodConfig::Unquantized(Linear::new(weights, None)))?;
 
     unquant.gather_forward(x, ids)
+}
+
+/// Quantized matmul of each routed expert on its own slice of the bank, instead of dequantizing every expert.
+fn routed_qmatmul(qtensor: &QTensor, x: &Tensor, ids: &Tensor) -> Result<Tensor> {
+    let (num_experts, n, k) = qtensor.shape().dims3()?;
+    let (tokens, _, _) = x.dims3()?;
+    let (_, topk) = ids.dims2()?;
+    let rows = x
+        .to_dtype(DType::F32)?
+        .broadcast_as((tokens, topk, k))?
+        .reshape((tokens * topk, k))?;
+    let data = qtensor.data()?;
+    let expert_bytes = data.len() / num_experts;
+    let out = crate::unquantized::grouped_expert_matmul(
+        &rows,
+        &ids.flatten_all()?,
+        num_experts,
+        |e, xs| {
+            let bytes = &data[e * expert_bytes..(e + 1) * expert_bytes];
+            let storage = QStorage::from_data(Cow::Borrowed(bytes), &Device::Cpu, qtensor.dtype())?;
+            QMatMul::from_qtensor(QTensor::new(storage, (n, k))?)?.forward(xs)
+        },
+    )?;
+    out.reshape((tokens, topk, n))
 }
 
 /// Perform indexed MoE forward pass on a QMatMul.
@@ -100,5 +129,36 @@ pub fn cpu_indexed_moe_forward(qmatmul: &QMatMul, x: &Tensor, ids: &Tensor) -> R
                 UnquantLinear::new(QuantMethodConfig::Unquantized(Linear::new(t.clone(), None)))?;
             unquant.gather_forward(x, ids)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_core::quantized::GgmlDType;
+
+    #[test]
+    fn routed_qmatmul_matches_dequantized_gather() -> Result<()> {
+        let device = Device::Cpu;
+        let w = Tensor::randn(0f32, 1., (6, 16, 64), &device)?;
+        let qtensor = QTensor::quantize(&w, GgmlDType::Q8_0)?;
+        let x = Tensor::randn(0f32, 1., (5, 1, 64), &device)?;
+        let ids = Tensor::new(&[[0u32, 3], [5, 3], [1, 0], [3, 2], [4, 4]], &device)?;
+
+        let dequant = UnquantLinear::new(QuantMethodConfig::Unquantized(Linear::new(
+            qtensor.dequantize(&device)?,
+            None,
+        )))?;
+        let reference = dequant.gather_forward(&x, &ids)?;
+        let routed = routed_qmatmul(&qtensor, &x, &ids)?;
+
+        // activations get quantized to q8 in the quantized matmul, so allow a little slack
+        let err = (reference.clone() - routed)?
+            .abs()?
+            .max_all()?
+            .to_scalar::<f32>()?;
+        let scale = reference.abs()?.max_all()?.to_scalar::<f32>()?;
+        assert!(err < 0.02 * scale, "err {err} scale {scale}");
+        Ok(())
     }
 }
