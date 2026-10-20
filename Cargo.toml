@@ -58,7 +58,7 @@ intel-mkl-src = { version = "0.8.1", features = ["mkl-static-lp64-iomp"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 metrics = "0.24.6"
-metrics-exporter-prometheus = "0.18.3"
+metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
 futures = "0.3"
 clap = { version = "4.5.54", features = ["derive", "wrap_help"] }
 pyo3 = { version = "0.25.1", features = ["full", "extension-module", "either", "abi3-py310"] }
@@ -114,17 +114,11 @@ dirs = "6.0.0"
 thiserror = "2.0.18"
 tokenizers = { version = "0.21.4", default-features = false }
 tokio-tungstenite = "0.28.0"
-tqdm = "0.8.0"
 chrono = "0.4.43"
 minijinja = { version = "2.14.0", features = ["builtins", "json", "preserve_order"] }
 minijinja-contrib = { version = "2.14.0", features = ["pycompat"] }
 regex-automata = { version = "0.4.13", features = ["meta"] }
-rustc-hash = "2.1.1"
-vob = "3.0.6"
-cfgrammar = "0.14.1"
-lrtable = "0.14.1"
 galil-seiferas = "0.1.5"
-radix_trie = "0.3.0"
 bytemuck = "1.24.0"
 tokio-rayon = "2.1.0"
 rand_isaac = "0.4.0"
@@ -133,10 +127,8 @@ async-trait = "0.1.92"
 strum = { version = "0.27.2", features = ["derive"] }
 derive_more = { version = "2.1.1", default-features = false, features = ["from"] }
 akin = "0.4.0"
-variantly = "0.4.0"
 sysinfo = "0.36.1"
 csv = "1.4.0"
-bytemuck_derive = "1.10.2"
 uuid = "1.19.0"
 schemars = "1.2.0"
 serde-saphyr = "0.0.16"
@@ -150,17 +142,14 @@ serde-big-array = "0.5.1"
 interprocess = "2.2.3"
 urlencoding = "2.1.3"
 scraper = "0.25.0"
-html2text = "0.16.6"
-zip = { version = "2.4.2", default-features = false, features = ["deflate"] }
+html2text = "0.16.5"
+zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 ordered-float = "5.1.0"
-hashbrown = "0.16.1"
-parking_lot = "0.12.5"
 ahash = "0.8.12"
 num-traits = "0.2.19"
 libc = "0.2.180"
 bm25 = "2.3.2"
 symphonia = { version = "0.5.5", default-features = false, features = ["mp3", "flac", "vorbis", "wav", "isomp4", "ogg", "pcm"] }
-lazy_static = "1.5"
 paste = "1.0.15"
 byteorder = "1.5.0"
 yoke = { version = "0.8.1", features = ["derive"] }
@@ -173,19 +162,15 @@ rustyline = { version = "15.0.0", default-features = false, features = ["with-fi
 tower-http = "0.6.8"
 utoipa-swagger-ui = { version = "9.0.2", features = ["axum", "vendored"] }
 futures-util = "0.3.31"
-axum_static = "1.8.6"
 mime_guess = "2.0.5"
 include_dir = "0.7.4"
 http = "1.4.0"
 http-body = "1.0.1"
-hyper = "1.8.1"
 rust-mcp-schema = { version = "0.9.5", default-features = false, features = ["schema_utils", "latest"] }
 cudaforge = "=0.1.6"
 rubato = "0.16.2"
 rustfft = "6.4.1"
 hound = "3.5.1"
-apodize = "1.0.0"
-statrs = "0.18.0"
 seccompiler = "0.5.0"
 landlock = "0.4.4"
 nix = { version = "0.31.3", default-features = false }

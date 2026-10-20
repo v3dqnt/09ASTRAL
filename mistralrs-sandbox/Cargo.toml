@@ -12,7 +12,6 @@ repository.workspace = true
 readme = "../README.md"
 
 [dependencies]
-anyhow.workspace = true
 libc.workspace = true
 serde = { workspace = true, features = ["derive"] }
 thiserror.workspace = true

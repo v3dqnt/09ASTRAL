@@ -8,7 +8,6 @@ use mistralrs_quant::{
     ColumnParallelLayer, LoraLinearSpec, LoraSiteHandle, QuantMethod, ReplicatedLayer,
     RowParallelLayer, ShardedVarBuilder,
 };
-use statrs::distribution::{ContinuousCDF, Normal};
 
 use crate::{
     amoe::AnyMoeBaseModelMixin,
@@ -251,8 +250,7 @@ impl Mlp {
     }
 
     fn std_multiplier(p: f64) -> f64 {
-        let normal = Normal::new(0.0, 1.0).unwrap();
-        normal.inverse_cdf(p)
+        -std::f64::consts::SQRT_2 * candle_core::cpu::erf::erfc_inv(2.0 * p)
     }
 
     fn gaussian_topk(&self, xs: &Tensor) -> Result<Tensor> {

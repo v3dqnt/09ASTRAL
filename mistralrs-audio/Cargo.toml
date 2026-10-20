@@ -16,4 +16,3 @@ homepage.workspace = true
 anyhow.workspace = true
 hound.workspace = true
 symphonia.workspace = true
-apodize.workspace = true
